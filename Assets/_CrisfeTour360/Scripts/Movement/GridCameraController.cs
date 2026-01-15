@@ -1,3 +1,4 @@
+using System.Collections;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
@@ -6,12 +7,18 @@ public class GridCameraController : MonoBehaviour
     [Header("References")]
     public GridNodeGraph graph;
     public Transform cameraPivot;
+    [Header("Pulse Blur")]
+    public ViewPointBlurPulse pulse; 
 
     [Header("Movement (Grid)")]
     public bool showCursor = false;
     public float moveSmoothTime = 0.15f;
     public float inputRepeatDelay = 0.18f;
     public bool keepCameraHeight = true;
+    [Header("ViewPoint Switching")]
+    public float deactivatePreviousDelay = 0.08f; 
+    Coroutine switchCo;
+
 
     [Header("Look")]
     public float lookSensitivity = 120f;
@@ -21,7 +28,6 @@ public class GridCameraController : MonoBehaviour
 
     [Header("Mobile Tuning")]
     public float mobileSensitivityDivider = 15f;
-
     float lookMultiplier = 1f;
     float zoomMultiplier = 1f;
 
@@ -86,6 +92,7 @@ public class GridCameraController : MonoBehaviour
 
         Cursor.visible = showCursor;
 
+        deactivatePreviousDelay = moveSmoothTime * 0.55f;
     }
 
     void Start()
@@ -190,18 +197,39 @@ public class GridCameraController : MonoBehaviour
 
     void UpdateActiveViewNode()
     {
-        if (currentNode != null) currentNode.SetViewActive(false);
+        if (switchCo != null) StopCoroutine(switchCo);
 
-        if (graph.TryGetNode(currentCell, out GridNode node))
+        GridNode prevNode = currentNode;
+
+        if (graph.TryGetNode(currentCell, out GridNode nextNode))
         {
-            currentNode = node;
+            currentNode = nextNode;
+
             currentNode.SetViewActive(true);
+
+            if (pulse != null) pulse.Pulse();
+
+            switchCo = StartCoroutine(DisablePrevAfterDelay(prevNode, deactivatePreviousDelay));
         }
         else
         {
+            if (prevNode != null) prevNode.SetViewActive(false);
             currentNode = null;
         }
     }
+
+    IEnumerator DisablePrevAfterDelay(GridNode prev, float delay)
+    {
+        if (delay > 0f) yield return new WaitForSeconds(delay);
+
+
+        if (prev != null && prev != currentNode)
+            prev.SetViewActive(false);
+
+        switchCo = null;
+    }
+
+
 
     void HandleGridMovement()
     {
