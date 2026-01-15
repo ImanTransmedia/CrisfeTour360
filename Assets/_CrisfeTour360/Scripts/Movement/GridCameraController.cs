@@ -5,9 +5,10 @@ public class GridCameraController : MonoBehaviour
 {
     [Header("References")]
     public GridNodeGraph graph;
-    public Transform cameraPivot; 
+    public Transform cameraPivot;
 
     [Header("Movement (Grid)")]
+    public bool showCursor = false;
     public float moveSmoothTime = 0.15f;
     public float inputRepeatDelay = 0.18f;
     public bool keepCameraHeight = true;
@@ -18,36 +19,76 @@ public class GridCameraController : MonoBehaviour
     public float maxPitch = 70f;
     public bool invertY = false;
 
+    [Header("Mobile Tuning")]
+    public float mobileSensitivityDivider = 15f;
+
+    float lookMultiplier = 1f;
+    float zoomMultiplier = 1f;
+
+
+    [Header("Zoom")]
+    bool isPinchingNow;
+    public float minFov = 50f;
+    public float maxFov = 120f;
+    public float mouseWheelZoomSpeed = 12f;
+    public float pinchZoomSpeed = 0.06f;
+
+    [Header("Tap Move")]
+    public bool enableTapMove = true;
+    public LayerMask tapHitMask = ~0;
+    public LayerMask blockHitMask = ~0;
+    public float tapMaxDistance = 250f;
+
+    public float tapMaxTime = 0.22f;
+    public float tapMaxMovePixels = 12f;
+
     [Header("Start")]
     public bool snapToClosestNodeOnStart = true;
 
-    // Input
-    private Vector2 moveInput;
-    private Vector2 lookInput;
-    private float nextMoveTime;
+    Vector2 moveInput;
+    float nextMoveTime;
 
-    // Grid state
-    private Vector2Int currentCell;
-    private Vector3 velocity;
-    private float fixedY;
+    Vector2Int currentCell;
+    Vector3 velocity;
+    float fixedY;
 
-    // Look state
-    private float yaw;
-    private float pitch;
-    private Vector2 lookDelta;
-    private bool isDragging;
+    float yaw;
+    float pitch;
+    Vector2 lookDelta;
+    bool isDragging;
 
-    private GridNode currentNode;
+    GridNode currentNode;
 
+    Camera cam;
+    Vector2 lastPinchVector;
+    bool wasPinching;
 
+    Vector2 pointerPos;
+    bool hasPointerPos;
 
-    private void Awake()
+    bool pressDown;
+    float pressTime;
+    Vector2 pressPos;
+    bool movedTooMuch;
+
+    void Awake()
     {
         if (!graph) graph = FindObjectOfType<GridNodeGraph>();
-        if (!cameraPivot) cameraPivot = Camera.main.transform;
+        if (!cameraPivot && Camera.main != null) cameraPivot = Camera.main.transform;
+
+        if (cameraPivot != null)
+        {
+            cam = cameraPivot.GetComponent<Camera>();
+            if (cam == null) cam = cameraPivot.GetComponentInChildren<Camera>();
+        }
+
+        if (cam == null && Camera.main != null) cam = Camera.main;
+
+        Cursor.visible = showCursor;
+
     }
 
-    private void Start()
+    void Start()
     {
         if (!graph)
         {
@@ -66,20 +107,7 @@ public class GridCameraController : MonoBehaviour
 
         if (snapToClosestNodeOnStart)
         {
-            float best = float.PositiveInfinity;
-            Vector2Int bestCell = graph.WorldToCell(transform.position);
-
-            foreach (var kvp in graph.NodesByCell)
-            {
-                Vector3 target = graph.CellToWorldCenter(kvp.Key, fixedY);
-                float d = (transform.position - target).sqrMagnitude;
-                if (d < best)
-                {
-                    best = d;
-                    bestCell = kvp.Key;
-                }
-            }
-
+            Vector2Int bestCell = FindClosestCellToPoint(transform.position);
             currentCell = bestCell;
             UpdateActiveViewNode();
             transform.position = GetTargetWorldPos(currentCell);
@@ -87,67 +115,95 @@ public class GridCameraController : MonoBehaviour
         else
         {
             currentCell = graph.WorldToCell(transform.position);
+            UpdateActiveViewNode();
         }
+
+        if (cam != null) cam.fieldOfView = Mathf.Clamp(cam.fieldOfView, minFov, maxFov);
+
+        bool isMobile = DeviceDetector.Instance != null && DeviceDetector.Instance.IsMobile;
+
+        if (isMobile)
+        {
+            lookMultiplier = 1f / mobileSensitivityDivider;
+            zoomMultiplier = 1f / mobileSensitivityDivider;
+        }
+        else
+        {
+            lookMultiplier = 1f;
+            zoomMultiplier = 1f;
+        }
+
     }
 
-    private void Update()
+    void Update()
     {
+        isPinchingNow = IsTwoFingerPinching();
+
+        HandleMouseWheelZoom();
+        HandlePinchZoom();
+
+        if (isPinchingNow)
+        {
+            isDragging = false;
+            lookDelta = Vector2.zero;
+            pressDown = false;
+            movedTooMuch = false;
+            return;
+        }
+
         HandleGridMovement();
         HandleLook();
+        UpdateTapState();
+        FallbackTapPolling();
     }
 
-    private void LateUpdate()
+
+    void LateUpdate()
     {
         Vector3 targetPos = GetTargetWorldPos(currentCell);
-
-        transform.position = Vector3.SmoothDamp(
-            transform.position,
-            targetPos,
-            ref velocity,
-            moveSmoothTime
-        );
+        transform.position = Vector3.SmoothDamp(transform.position, targetPos, ref velocity, moveSmoothTime);
     }
 
-
-    private void OnApplicationFocus(bool hasFocus)
-    {
-        if (!hasFocus)
-        {
-            isDragging = false;
-            lookDelta = Vector2.zero;
-        }
-    }
-
-    private void OnApplicationPause(bool paused)
-    {
-        if (paused)
-        {
-            isDragging = false;
-            lookDelta = Vector2.zero;
-        }
-    }
-
-    private void OnDisable()
+    void ResetPointerState()
     {
         isDragging = false;
         lookDelta = Vector2.zero;
+        wasPinching = false;
+        pressDown = false;
+        movedTooMuch = false;
     }
 
-    private void UpdateActiveViewNode()
+    void OnApplicationFocus(bool hasFocus)
     {
-        // Apagar el anterior
-        if (currentNode != null)
-            currentNode.SetViewActive(false);
+        if (!hasFocus) ResetPointerState();
+    }
 
-        // Encender el nuevo
+    void OnApplicationPause(bool paused)
+    {
+        if (paused) ResetPointerState();
+    }
+
+    void OnDisable()
+    {
+        ResetPointerState();
+    }
+
+    void UpdateActiveViewNode()
+    {
+        if (currentNode != null) currentNode.SetViewActive(false);
+
         if (graph.TryGetNode(currentCell, out GridNode node))
         {
             currentNode = node;
             currentNode.SetViewActive(true);
         }
+        else
+        {
+            currentNode = null;
+        }
     }
 
-    private void HandleGridMovement()
+    void HandleGridMovement()
     {
         if (Time.time < nextMoveTime) return;
 
@@ -162,17 +218,16 @@ public class GridCameraController : MonoBehaviour
             UpdateActiveViewNode();
         }
 
-
         nextMoveTime = Time.time + inputRepeatDelay;
     }
 
-    private Vector3 GetTargetWorldPos(Vector2Int cell)
+    Vector3 GetTargetWorldPos(Vector2Int cell)
     {
         float y = keepCameraHeight ? fixedY : transform.position.y;
         return graph.CellToWorldCenter(cell, y);
     }
 
-    private Vector2Int ReadCardinalRelativeToCamera(Vector2 input)
+    Vector2Int ReadCardinalRelativeToCamera(Vector2 input)
     {
         if (input.sqrMagnitude < 0.04f) return Vector2Int.zero;
 
@@ -188,22 +243,22 @@ public class GridCameraController : MonoBehaviour
             if (Mathf.Abs(desiredWorld.x) > Mathf.Abs(desiredWorld.z))
                 return desiredWorld.x > 0 ? Vector2Int.right : Vector2Int.left;
             else
-                return desiredWorld.z > 0 ? Vector2Int.up : Vector2Int.down; // up = +Z
+                return desiredWorld.z > 0 ? Vector2Int.up : Vector2Int.down;
         }
         else
         {
             if (Mathf.Abs(desiredWorld.x) > Mathf.Abs(desiredWorld.y))
                 return desiredWorld.x > 0 ? Vector2Int.right : Vector2Int.left;
             else
-                return desiredWorld.y > 0 ? Vector2Int.up : Vector2Int.down; // up = +Y
+                return desiredWorld.y > 0 ? Vector2Int.up : Vector2Int.down;
         }
     }
 
-    private void HandleLook()
+    void HandleLook()
     {
         if (!isDragging) return;
 
-        if (!Pointer.current.press.isPressed)
+        if (Pointer.current == null || !Pointer.current.press.isPressed)
         {
             isDragging = false;
             lookDelta = Vector2.zero;
@@ -212,8 +267,8 @@ public class GridCameraController : MonoBehaviour
 
         if (lookDelta.sqrMagnitude < 0.0001f) return;
 
-        float deltaX = lookDelta.x * lookSensitivity * Time.deltaTime;
-        float deltaY = lookDelta.y * lookSensitivity * Time.deltaTime;
+        float deltaX = lookDelta.x * lookSensitivity * lookMultiplier * Time.deltaTime;
+        float deltaY = lookDelta.y * lookSensitivity * lookMultiplier * Time.deltaTime;
 
         yaw += deltaX;
         pitch += invertY ? deltaY : -deltaY;
@@ -224,6 +279,165 @@ public class GridCameraController : MonoBehaviour
         lookDelta = Vector2.zero;
     }
 
+    void HandleMouseWheelZoom()
+    {
+        if (cam == null || Mouse.current == null) return;
+
+        float scroll = Mouse.current.scroll.ReadValue().y;
+        if (Mathf.Abs(scroll) > 0.01f)
+        {
+            cam.fieldOfView -= scroll * mouseWheelZoomSpeed * zoomMultiplier * Time.deltaTime;
+            cam.fieldOfView = Mathf.Clamp(cam.fieldOfView, minFov, maxFov);
+        }
+
+
+    }
+
+    void HandlePinchZoom()
+    {
+        if (cam == null || Touchscreen.current == null) return;
+
+        var touches = Touchscreen.current.touches;
+
+        if (touches.Count < 2)
+        {
+            wasPinching = false;
+            return;
+        }
+
+        if (!touches[0].isInProgress || !touches[1].isInProgress)
+        {
+            wasPinching = false;
+            return;
+        }
+
+        Vector2 p0 = touches[0].position.ReadValue();
+        Vector2 p1 = touches[1].position.ReadValue();
+        Vector2 pinchVector = p0 - p1;
+
+        if (wasPinching)
+        {
+            float delta = pinchVector.magnitude - lastPinchVector.magnitude;
+            cam.fieldOfView -= delta * pinchZoomSpeed * zoomMultiplier;
+            cam.fieldOfView = Mathf.Clamp(cam.fieldOfView, minFov, maxFov);
+        }
+
+
+        lastPinchVector = pinchVector;
+        wasPinching = true;
+    }
+
+    bool IsTwoFingerPinching()
+    {
+        if (Touchscreen.current == null) return false;
+        var touches = Touchscreen.current.touches;
+        if (touches.Count < 2) return false;
+        return touches[0].isInProgress && touches[1].isInProgress;
+    }
+
+    void UpdateTapState()
+    {
+        if (!pressDown) return;
+        if (!hasPointerPos) return;
+        if (movedTooMuch) return;
+
+        float moved = (pointerPos - pressPos).magnitude;
+        if (moved > tapMaxMovePixels) movedTooMuch = true;
+    }
+
+    void TryTapMove(Vector2 screenPos)
+    {
+        if (!enableTapMove) return;
+        if (cam == null) return;
+        if (IsTwoFingerPinching()) return;
+
+        Ray ray = cam.ScreenPointToRay(screenPos);
+        if (Physics.Raycast(ray, out RaycastHit hit, tapMaxDistance, tapHitMask, QueryTriggerInteraction.Ignore))
+        {
+            Vector2Int bestCell = FindClosestCellToPoint(hit.point);
+            if (graph.HasNode(bestCell))
+            {
+                currentCell = bestCell;
+                UpdateActiveViewNode();
+            }
+        }
+    }
+
+    Vector2Int FindClosestCellToPoint(Vector3 worldPoint)
+    {
+        float best = float.PositiveInfinity;
+        Vector2Int bestCell = graph.WorldToCell(worldPoint);
+
+        foreach (var kvp in graph.NodesByCell)
+        {
+            Vector3 nodeCenter = graph.CellToWorldCenter(kvp.Key, keepCameraHeight ? fixedY : worldPoint.y);
+            float d = (nodeCenter - worldPoint).sqrMagnitude;
+            if (d < best)
+            {
+                best = d;
+                bestCell = kvp.Key;
+            }
+        }
+
+        return bestCell;
+    }
+
+    void FallbackTapPolling()
+    {
+        if (!enableTapMove) return;
+        if (cam == null) return;
+
+        if (!hasPointerPos)
+        {
+            if (Mouse.current != null) { pointerPos = Mouse.current.position.ReadValue(); hasPointerPos = true; }
+            else if (Touchscreen.current != null) { pointerPos = Touchscreen.current.primaryTouch.position.ReadValue(); hasPointerPos = true; }
+        }
+
+        if (Mouse.current != null)
+        {
+            if (Mouse.current.leftButton.wasPressedThisFrame)
+            {
+                pressDown = true;
+                pressTime = Time.time;
+                pressPos = Mouse.current.position.ReadValue();
+                pointerPos = pressPos;
+                hasPointerPos = true;
+                movedTooMuch = false;
+            }
+
+            if (pressDown && Mouse.current.leftButton.wasReleasedThisFrame)
+            {
+                float held = Time.time - pressTime;
+                float moved = (Mouse.current.position.ReadValue() - pressPos).magnitude;
+                bool isTap = held <= tapMaxTime && moved <= tapMaxMovePixels;
+                pressDown = false;
+                if (isTap) TryTapMove(pressPos);
+            }
+        }
+
+        if (Touchscreen.current != null)
+        {
+            var t = Touchscreen.current.primaryTouch;
+            if (t.press.wasPressedThisFrame)
+            {
+                pressDown = true;
+                pressTime = Time.time;
+                pressPos = t.position.ReadValue();
+                pointerPos = pressPos;
+                hasPointerPos = true;
+                movedTooMuch = false;
+            }
+
+            if (pressDown && t.press.wasReleasedThisFrame)
+            {
+                float held = Time.time - pressTime;
+                float moved = (t.position.ReadValue() - pressPos).magnitude;
+                bool isTap = held <= tapMaxTime && moved <= tapMaxMovePixels;
+                pressDown = false;
+                if (isTap) TryTapMove(pressPos);
+            }
+        }
+    }
 
     public void OnLookDelta(InputValue value)
     {
@@ -232,8 +446,29 @@ public class GridCameraController : MonoBehaviour
 
     public void OnLookPress(InputValue value)
     {
-        isDragging = value.isPressed;
-        if (!isDragging) lookDelta = Vector2.zero;
+        if (IsTwoFingerPinching()) return;
+
+        bool pressed = value.isPressed;
+
+        if (pressed)
+        {
+            pressDown = true;
+            pressTime = Time.time;
+            pressPos = pointerPos;
+            movedTooMuch = false;
+            isDragging = true;
+        }
+        else
+        {
+            float held = Time.time - pressTime;
+            bool isTap = held <= tapMaxTime && !movedTooMuch;
+
+            pressDown = false;
+            isDragging = false;
+            lookDelta = Vector2.zero;
+
+            if (isTap) TryTapMove(pressPos);
+        }
     }
 
     public void OnMove(InputValue value)
@@ -241,4 +476,18 @@ public class GridCameraController : MonoBehaviour
         moveInput = value.Get<Vector2>();
     }
 
+    public void OnZoom(InputValue value)
+    {
+        if (cam == null) return;
+
+        float v = value.Get<float>();
+        cam.fieldOfView -= v * mouseWheelZoomSpeed * Time.deltaTime;
+        cam.fieldOfView = Mathf.Clamp(cam.fieldOfView, minFov, maxFov);
+    }
+
+    public void OnPoint(InputValue value)
+    {
+        pointerPos = value.Get<Vector2>();
+        hasPointerPos = true;
+    }
 }
